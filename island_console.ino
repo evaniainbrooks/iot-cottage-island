@@ -58,7 +58,14 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define SIDE_DOOR_PIN 8
 #define IR_PIN 9
 
-void(* resetFunc) (void) = 0; //declare reset function @ address 0
+void(* __resetFunc) (void) = 0; //declare reset function @ address 0
+
+void resetFunc(const __FlashStringHelper* msg) {
+  Serial.println(msg);
+  Serial.println(F("Resetting in 2 seconds"));
+  delay(2000);
+  __resetFunc();
+}
 
 // Digital Pin states
 int sideDoorState = HIGH;
@@ -86,7 +93,9 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 
 /****************************** Feeds ***************************************/
 
-// Setup a feed called 'photocell' for publishing.
+#define WILL_FEED AIO_USERNAME "/feeds/nodes.island"
+Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
+
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
 Adafruit_MQTT_Publish front = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.front");
 Adafruit_MQTT_Publish side = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.side");
@@ -146,6 +155,8 @@ void setup() {
   mqtt.subscribe(&islandlight);
   mqtt.subscribe(&outsidelight);
   mqtt.subscribe(&ledtoggle);
+
+  mqtt.will(WILL_FEED, "0");
 
   //mqtt.subscribe(&soundbartoggle);
 
@@ -353,6 +364,8 @@ void MQTT_ping() {
     if (!mqtt.ping()) {
       Serial.println(F("Failed to ping"));
       mqtt.disconnect();
+    } else {
+      lastwill.publish(String(now, DEC).c_str());
     }
   }
 }
