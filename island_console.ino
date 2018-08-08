@@ -8,9 +8,11 @@
 #include <Dns.h>
 #include <Dhcp.h>
 
-unsigned long lastPing = 0;
-unsigned long connectedSince = 0;
-unsigned long now = 0;
+unsigned long lastPing = 0; // timestamp
+unsigned long connectedSince = 0; // timestamp
+unsigned long now = 0; // timestamp
+unsigned long nextConnectionAttempt = 0; // timestamp
+unsigned long failedConnectionAttempts = 0;
 
 /************************* Ethernet Client Setup *****************************/
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
@@ -21,15 +23,16 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 //IPAddress dnsIP (8, 8, 8, 8);
 //If you uncommented either of the above lines, make sure to change "Ethernet.begin(mac)" to "Ethernet.begin(mac, iotIP)" or "Ethernet.begin(mac, iotIP, dnsIP)"
 
-#define VERSION_MESSAGE F("Island Console v0.13 24/07/18")
+#define VERSION_MESSAGE F("Island Console v0.16 28/07/18")
 
-// Adafruit IO setup
-#define AIO_SERVER      "io.adafruit.com"
+#define AIO_SERVER      "192.168.2.20"
 #define AIO_SERVERPORT  1883
-#define AIO_USERNAME    "abc"
-#define AIO_KEY         "xyz"
+#define AIO_USERNAME    "mosquitto"
+#define AIO_KEY         "qq211"
 
 #define SERVER_LISTEN_PORT 80
+#define MQTT_CONNECT_RETRY_MAX 5
+#define MQTT_PING_INTERVAL_MS 60000
 
 // LED strip commands
 #define On_Off 0xFF02FD
@@ -50,32 +53,29 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
 // Digital Pin layout
 #define FRONT_DOOR_PIN 2
-#define COUNTER_LIGHT_PIN 18
-#define SINK_LIGHT_PIN 19
+#define COUNTER_LIGHT_PIN 31
+#define SINK_LIGHT_PIN 30
+#define MOTION_SENSOR_PIN 32
 #define OUTSIDE_LIGHT_PIN 5
 #define KITCHEN_LIGHT_PIN 6
-#define ISLAND_LIGHT_PIN 17
+#define ISLAND_LIGHT_PIN 33
 #define SIDE_DOOR_PIN 8
 #define IR_PIN 9
 
+#define halt(s) { Serial.println(F( s )); while(1);  }
+
 void(* __resetFunc) (void) = 0; //declare reset function @ address 0
 
-void resetFunc(const __FlashStringHelper* msg) {
+void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
   Serial.println(msg);
-  Serial.println(F("Resetting in 2 seconds"));
-  delay(2000);
+  Serial.print(F("Resetting in "));
+  Serial.print(delayMs / 1000);
+  Serial.println(F("s"));
+  delay(delayMs);
   __resetFunc();
 }
 
-// Digital Pin states
-int sideDoorState = HIGH;
-int frontDoorState = HIGH;
-
-int outsideLightState = HIGH;
-int kitchenLightState = HIGH;
-int sinkLightState = HIGH;
-int counterLightState = HIGH;
-int islandLightState = HIGH;
+int lastState[50] = {0};
 
 //IRrecv irrecv(IR_RECV_PIN);
 //decode_results results;
@@ -92,13 +92,13 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
 /****************************** Feeds ***************************************/
-
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.island"
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
 
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
 Adafruit_MQTT_Publish front = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.front");
 Adafruit_MQTT_Publish side = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.side");
+Adafruit_MQTT_Publish motion = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/status.motion");
 
 //Adafruit_MQTT_Subscribe tvtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.tv");
 Adafruit_MQTT_Subscribe ledtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.led");
@@ -118,6 +118,12 @@ Adafruit_MQTT_Subscribe sinklight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME 
 
 void setup() {
 
+  // Disable SD card
+  pinMode(4, OUTPUT);
+  digitalWrite(4, HIGH);
+  
+  delay(2000);
+
   pinMode(SIDE_DOOR_PIN, INPUT_PULLUP);
   pinMode(FRONT_DOOR_PIN, INPUT_PULLUP);
   pinMode(IR_PIN, OUTPUT);
@@ -127,6 +133,7 @@ void setup() {
   pinMode(ISLAND_LIGHT_PIN, OUTPUT);
   pinMode(COUNTER_LIGHT_PIN, OUTPUT);
   pinMode(SINK_LIGHT_PIN, OUTPUT);
+  pinMode(MOTION_SENSOR_PIN, INPUT);
 
   digitalWrite(OUTSIDE_LIGHT_PIN, HIGH);
   digitalWrite(KITCHEN_LIGHT_PIN, HIGH);
@@ -141,10 +148,11 @@ void setup() {
   // Initialise the Client
   Serial.println(F("Joining the network..."));
   Ethernet.begin(mac);
-  delay(1000); //give the ethernet a second to initialize
-  Serial.print("HTTP server listening on ");
+  delay(2000); //give the ethernet a second to initialize
   Serial.println(Ethernet.localIP());
-
+  if (Ethernet.localIP() == IPAddress(0,0,0,0)) {
+    resetFunc(F("DHCP resolution failed"), 30000);
+  }
 
   //MQTT_connect();
   Serial.println("MQTT subscribe");
@@ -176,7 +184,7 @@ void loop() {
   // this is our 'wait for incoming subscription packets' busy subloop
   Adafruit_MQTT_Subscribe *subscription;
   while ((subscription = mqtt.readSubscription(1000))) {
-    Serial.println("Incoming message");
+    Serial.println(F("Incoming message"));
     //irrecv.enableIRIn();
     //irrecv.resume();
 
@@ -184,11 +192,11 @@ void loop() {
      // Serial.println("msg: TOGGLE TV");
      // irsend.sendRC5(0xc, 4);
     //} else
+    char* command = (char*)subscription->lastread;
+    command[0] = tolower(command[0]);
     if (subscription == &ledtoggle) {
-      char* command = (char*)subscription->lastread;
-      command[0] = tolower(command[0]);
-
-      Serial.print("msg: TOGGLE LED ");
+      
+      Serial.print(F("msg: TOGGLE LED "));
       Serial.println(command);
 
       if (strstr(command, "on") != NULL || strstr(command, "off") != NULL) {
@@ -216,38 +224,38 @@ void loop() {
         delay(40);
       }
 
-      if (strstr(command, "brighter") != NULL || strstr(command, "Brighter") != NULL) {
+      if (strstr(command, "brighter") != NULL) {
         irsend.sendNEC(Brighter, 32);
         delay(40);
-      } else if (strstr(command, "dimmer") != NULL || strstr(command, "Dimmer") != NULL) {
+      } else if (strstr(command, "dimmer") != NULL) {
         irsend.sendNEC(Dimmer, 32);
         delay(40);
       }
 
-      if (strstr(command, "fade") != NULL || strstr(command, "Fade") != NULL) {
+      if (strstr(command, "fade") != NULL) {
         irsend.sendNEC(Fade7, 32);
         delay(40);
-      } else if (strstr(command, "strobe") != NULL || strstr(command, "Strobe") != NULL) {
+      } else if (strstr(command, "strobe") != NULL) {
         irsend.sendNEC(Jump7, 32);
         delay(40);
       }
 
-      if (strstr(command, "slow") != NULL || strstr(command, "Slow") != NULL) {
+      if (strstr(command, "slow") != NULL) {
         irsend.sendNEC(Slow, 32);
         delay(40);
-      } else if (strstr(command, "fast") != NULL || strstr(command, "Fast") != NULL) {
+      } else if (strstr(command, "fast") != NULL) {
         irsend.sendNEC(Fast, 32);
         delay(40);
       }
 
-      if (strstr(command, "brightest")  != NULL || strstr(command, "Brightest")  != NULL) {
+      if (strstr(command, "brightest")  != NULL) {
         for (int i = 0; i < 13; ++i) {
           irsend.sendNEC(Brighter, 32);
           delay(40);
         }
       }
 
-      if (strstr(command, "dimmest") != NULL || strstr(command, "Dimmest")  != NULL) {
+      if (strstr(command, "dimmest") != NULL) {
         for (int i = 0; i < 13; ++i) {
           irsend.sendNEC(Dimmer, 32);
           delay(40);
@@ -258,36 +266,27 @@ void loop() {
     } else if (subscription == &outsidelight) {
 
       Serial.println(F("msg: OUTSIDE LIGHT"));
-      outsideLightState = (outsideLightState == HIGH ? LOW : HIGH);
-      digitalWrite(OUTSIDE_LIGHT_PIN, outsideLightState);
-
+      handleMqttToggleCommand(command, OUTSIDE_LIGHT_PIN);
 
     } else if (subscription == &kitchenlight) {
 
       Serial.println(F("msg: KITCHEN LIGHT"));
-      kitchenLightState = (kitchenLightState == HIGH ? LOW : HIGH);
-      digitalWrite(KITCHEN_LIGHT_PIN, kitchenLightState);
-
+      handleMqttToggleCommand(command, KITCHEN_LIGHT_PIN);
 
     } else if (subscription == &islandlight) {
 
       Serial.println(F("msg: ISLAND LIGHT"));
-      islandLightState = (islandLightState == HIGH ? LOW : HIGH);
-      digitalWrite(ISLAND_LIGHT_PIN, islandLightState);
-
+      handleMqttToggleCommand(command, ISLAND_LIGHT_PIN);
 
     } else if (subscription == &counterlight) {
 
       Serial.println(F("msg: COUNTER LIGHT"));
-      counterLightState = (counterLightState == HIGH ? LOW : HIGH);
-      digitalWrite(COUNTER_LIGHT_PIN, counterLightState);
-
+      handleMqttToggleCommand(command, COUNTER_LIGHT_PIN);
 
     } else if (subscription == &sinklight) {
 
       Serial.println(F("msg: SINK LIGHT"));
-      sinkLightState = (sinkLightState == HIGH ? LOW : HIGH);
-      digitalWrite(SINK_LIGHT_PIN, sinkLightState);
+      handleMqttToggleCommand(command, SINK_LIGHT_PIN);
     }
 
     //else if (subscription == &soundbartoggle) {
@@ -298,6 +297,7 @@ void loop() {
 
   detectEdge(FRONT_DOOR_PIN, &front);
   detectEdge(SIDE_DOOR_PIN, &side);
+  detectEdge(MOTION_SENSOR_PIN, &motion);
 
   handleHttpClientRequest();
 
@@ -307,8 +307,17 @@ void loop() {
   delay(1000);
 }
 
-
-int lastState[25] = {0};
+void handleMqttToggleCommand(const char* command, int outputPin) {
+   if (strcmp(command, "1") == 0) {
+    Serial.println(F("ON"));
+    digitalWrite(outputPin, LOW);
+    lastState[outputPin] = LOW;
+  } else {
+    Serial.println(F("OFF"));
+    digitalWrite(outputPin, HIGH);
+    lastState[outputPin] = HIGH;
+  }
+}
 
 void detectEdge(int pin, Adafruit_MQTT_Publish* feed) {
   int state = digitalRead(pin);
@@ -358,18 +367,21 @@ void IR_decode() {
 
 void MQTT_ping() {
 
-  if (lastPing + 60000 < now) {
+  if (!mqtt.connected()) {
+    return;
+  }
+
+  if (lastPing + MQTT_PING_INTERVAL_MS < now) {
     Serial.println(F("Ping"));
     lastPing = now;
     if (!mqtt.ping()) {
       Serial.println(F("Failed to ping"));
       mqtt.disconnect();
     } else {
-      lastwill.publish(String(now, DEC).c_str());
+      lastwill.publish(now);
     }
   }
 }
-
 
 void MQTT_connect() {
   int8_t ret;
@@ -379,26 +391,32 @@ void MQTT_connect() {
     return;
   }
 
-  Serial.print(F("Connecting to MQTT... "));
+  if (nextConnectionAttempt < now) {
+    Serial.print(F("Connecting to MQTT... "));
 
-  int attempts = 0;
-  while (++attempts < 10 && (ret = mqtt.connect()) != 0) {
-    Serial.println(mqtt.connectErrorString(ret));
-    Serial.print(F("Retrying MQTT connection in "));
+    int delaySecs = (2 << failedConnectionAttempts); // Delay for 2, 4, 8 .. seconds
+    if (ret = mqtt.connect() != 0) {
+      Serial.print(F("Failed: "));
+      Serial.println(mqtt.connectErrorString(ret));
+      //mqtt.disconnect();
 
-    int delaySecs = (2 << attempts); // Delay for 2, 4, 8 .. seconds
-    Serial.print(delaySecs);
-    Serial.println(F(" seconds"));
-    mqtt.disconnect();
-    delay(delaySecs * 1000);
-  }
+      nextConnectionAttempt = now + delaySecs * 1000;
+      ++failedConnectionAttempts;
+    }
+  
+    if (0 == ret) {
+      connectedSince = millis();
+      failedConnectionAttempts = 0;
+      Serial.println(F("Connected!"));
+    } else if (failedConnectionAttempts > MQTT_CONNECT_RETRY_MAX) {
+      connectedSince = 0;
+      resetFunc(F("Max retries exhausted!"), 2000); // Reset and try again
+    } else {
+      Serial.print(F("Retrying in "));
 
-  if (0 == ret) {
-    connectedSince = millis();
-    Serial.println(F("MQTT Connected!"));
-  } else {
-    connectedSince = 0;
-    resetFunc(F("Failed connection!")); // Reset and try again
+      Serial.print(delaySecs);
+      Serial.println(F("s"));
+    }
   }
 }
 
@@ -431,15 +449,15 @@ void handleHttpClientRequest() {
           client.print(VERSION_MESSAGE);
           client.println(F("</h1>"));
           client.print(F("<br />Outside light is "));
-          client.println(outsideLightState);
+          client.println(lastState[OUTSIDE_LIGHT_PIN]);
           client.print(F("<br />Kitchen light is "));
-          client.println(kitchenLightState);
+          client.println(lastState[KITCHEN_LIGHT_PIN]);
           client.print(F("<br />Counter light is "));
-          client.println(counterLightState);
+          client.println(lastState[COUNTER_LIGHT_PIN]);
           client.print(F("<br />Island light is "));
-          client.println(islandLightState);
+          client.println(lastState[ISLAND_LIGHT_PIN]);
           client.print(F("<br />Sink light is "));
-          client.println(sinkLightState);
+          client.println(lastState[SINK_LIGHT_PIN]);
           client.print(F("<br />Front door is "));
           client.println(lastState[FRONT_DOOR_PIN]);
           client.print(F("<br />Side door is "));
