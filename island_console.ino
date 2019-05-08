@@ -9,10 +9,12 @@
 #include <Dhcp.h>
 
 unsigned long lastPing = 0; // timestamp
+unsigned long lastCurrentSensorRead = 0; // timestamp
 unsigned long connectedSince = 0; // timestamp
 unsigned long now = 0; // timestamp
 unsigned long nextConnectionAttempt = 0; // timestamp
 unsigned long failedConnectionAttempts = 0;
+unsigned long sensorIndex = 0;
 
 /************************* Ethernet Client Setup *****************************/
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
@@ -23,7 +25,7 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 //IPAddress dnsIP (8, 8, 8, 8);
 //If you uncommented either of the above lines, make sure to change "Ethernet.begin(mac)" to "Ethernet.begin(mac, iotIP)" or "Ethernet.begin(mac, iotIP, dnsIP)"
 
-#define VERSION_MESSAGE F("Island Console v0.16 28/07/18")
+#define VERSION_MESSAGE F("Island Console v0.20 25/08/18")
 
 #define AIO_SERVER      "192.168.2.20"
 #define AIO_SERVERPORT  1883
@@ -33,6 +35,7 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define SERVER_LISTEN_PORT 80
 #define MQTT_CONNECT_RETRY_MAX 5
 #define MQTT_PING_INTERVAL_MS 60000
+#define CURRENT_SENSOR_INTERVAL_MS 3000
 
 // LED strip commands
 #define On_Off 0xFF02FD
@@ -62,6 +65,11 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define SIDE_DOOR_PIN 8
 #define IR_PIN 9
 
+// Analog pin layout
+#define ISLAND_LIGHT_CIRCUIT A1
+#define OUTSIDE_LIGHT_CIRCUIT A2
+#define KITCHEN_LIGHT_CIRCUIT A3
+
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
 void(* __resetFunc) (void) = 0; //declare reset function @ address 0
@@ -75,7 +83,7 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
   __resetFunc();
 }
 
-int lastState[50] = {0};
+int lastState[80] = {LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW};
 
 //IRrecv irrecv(IR_RECV_PIN);
 //decode_results results;
@@ -93,6 +101,7 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 
 /****************************** Feeds ***************************************/
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.island"
+
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
 
 // Notice MQTT paths for AIO follow the form: <username>/feeds/<feedname>
@@ -100,7 +109,10 @@ Adafruit_MQTT_Publish front = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/
 Adafruit_MQTT_Publish side = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/doors.side");
 Adafruit_MQTT_Publish motion = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/status.motion");
 
-//Adafruit_MQTT_Subscribe tvtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.tv");
+Adafruit_MQTT_Publish kitchenlight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
+Adafruit_MQTT_Publish islandlight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.islandlight");
+Adafruit_MQTT_Publish outsidelight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
+
 Adafruit_MQTT_Subscribe ledtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.led");
 Adafruit_MQTT_Subscribe kitchenlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
 Adafruit_MQTT_Subscribe outsidelight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
@@ -126,6 +138,7 @@ void setup() {
 
   pinMode(SIDE_DOOR_PIN, INPUT_PULLUP);
   pinMode(FRONT_DOOR_PIN, INPUT_PULLUP);
+  pinMode(MOTION_SENSOR_PIN, INPUT);
   pinMode(IR_PIN, OUTPUT);
 
   pinMode(OUTSIDE_LIGHT_PIN, OUTPUT);
@@ -133,13 +146,14 @@ void setup() {
   pinMode(ISLAND_LIGHT_PIN, OUTPUT);
   pinMode(COUNTER_LIGHT_PIN, OUTPUT);
   pinMode(SINK_LIGHT_PIN, OUTPUT);
-  pinMode(MOTION_SENSOR_PIN, INPUT);
 
   digitalWrite(OUTSIDE_LIGHT_PIN, HIGH);
   digitalWrite(KITCHEN_LIGHT_PIN, HIGH);
   digitalWrite(ISLAND_LIGHT_PIN, HIGH);
   digitalWrite(COUNTER_LIGHT_PIN, HIGH);
+  lastState[COUNTER_LIGHT_PIN] = HIGH;
   digitalWrite(SINK_LIGHT_PIN, HIGH);
+  lastState[SINK_LIGHT_PIN] = HIGH;
 
   Serial.begin(115200);
 
@@ -266,27 +280,27 @@ void loop() {
     } else if (subscription == &outsidelight) {
 
       Serial.println(F("msg: OUTSIDE LIGHT"));
-      handleMqttToggleCommand(command, OUTSIDE_LIGHT_PIN);
+      handleMqttToggleCommand(command, OUTSIDE_LIGHT_PIN, OUTSIDE_LIGHT_CIRCUIT);
 
     } else if (subscription == &kitchenlight) {
 
       Serial.println(F("msg: KITCHEN LIGHT"));
-      handleMqttToggleCommand(command, KITCHEN_LIGHT_PIN);
+      handleMqttToggleCommand(command, KITCHEN_LIGHT_PIN, KITCHEN_LIGHT_CIRCUIT);
 
     } else if (subscription == &islandlight) {
 
       Serial.println(F("msg: ISLAND LIGHT"));
-      handleMqttToggleCommand(command, ISLAND_LIGHT_PIN);
+      handleMqttToggleCommand(command, ISLAND_LIGHT_PIN, ISLAND_LIGHT_CIRCUIT);
 
     } else if (subscription == &counterlight) {
 
       Serial.println(F("msg: COUNTER LIGHT"));
-      handleMqttToggleCommand(command, COUNTER_LIGHT_PIN);
+      handleMqttToggleCommand(command, COUNTER_LIGHT_PIN, -1);
 
     } else if (subscription == &sinklight) {
 
       Serial.println(F("msg: SINK LIGHT"));
-      handleMqttToggleCommand(command, SINK_LIGHT_PIN);
+      handleMqttToggleCommand(command, SINK_LIGHT_PIN, -1);
     }
 
     //else if (subscription == &soundbartoggle) {
@@ -298,37 +312,83 @@ void loop() {
   detectEdge(FRONT_DOOR_PIN, &front);
   detectEdge(SIDE_DOOR_PIN, &side);
   detectEdge(MOTION_SENSOR_PIN, &motion);
-
+  
   handleHttpClientRequest();
+
+  if (lastCurrentSensorRead + CURRENT_SENSOR_INTERVAL_MS < now) {
+    lastCurrentSensorRead = now;
+
+    if (sensorIndex == 0) {
+      Serial.println(F("Read kitchen light current"));
+      readAcs712(KITCHEN_LIGHT_CIRCUIT, &kitchenlight_pub);
+    }
+    if (sensorIndex == 1) {
+      Serial.println(F("Read island light current"));
+      readAcs712(ISLAND_LIGHT_CIRCUIT, &islandlight_pub);
+    }
+    if (sensorIndex == 2) {
+      Serial.println(F("Read outside light current"));
+      readAcs712(OUTSIDE_LIGHT_CIRCUIT, &outsidelight_pub);
+    }
+    
+    sensorIndex = (sensorIndex + 1) % 3;
+  }
 
   //IR_decode();
   MQTT_ping();
 
-  delay(1000);
+  delay(100);
 }
 
-void handleMqttToggleCommand(const char* command, int outputPin) {
-   if (strcmp(command, "1") == 0) {
-    Serial.println(F("ON"));
-    digitalWrite(outputPin, LOW);
-    lastState[outputPin] = LOW;
+void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
+
+  if (-1 == acsPin) {
+    
+    // For lights with no attached ACS sensr
+    if (strcmp((char *)command, "1") == 0 && lastState[outputPin] == HIGH) {
+      Serial.println(F("ACS-less relay is OFF (turn on)"));
+      lastState[outputPin] = LOW;
+      Serial.print(F("Setting state to "));
+      Serial.print(lastState[outputPin]);
+      digitalWrite(outputPin, lastState[outputPin]);
+
+    } else if (strcmp((char *)command, "0") == 0 && lastState[outputPin] == LOW) {
+      Serial.println(F("ACS-less relay is ON (turn off)"));
+      lastState[outputPin] = HIGH;
+      Serial.print(F("Setting state to "));
+      Serial.print(lastState[outputPin]);
+      digitalWrite(outputPin, lastState[outputPin]);
+    }
   } else {
-    Serial.println(F("OFF"));
-    digitalWrite(outputPin, HIGH);
-    lastState[outputPin] = HIGH;
+
+    // For lights with attached ACS sensor
+    if (strcmp((char *)command, "1") == 0 && lastState[acsPin] == LOW) {
+      Serial.println(F("ACS relay is OFF (turn on)"));
+      lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      Serial.print(F("Setting state to "));
+      Serial.print(lastState[outputPin]);
+      digitalWrite(outputPin, lastState[outputPin]);
+      
+    } else if (strcmp((char *)command, "0") == 0 && lastState[acsPin] == HIGH) {
+      Serial.println(F("ACS relay is ON (turn off)"));
+      lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      Serial.print(F("Setting state to "));
+      Serial.print(lastState[outputPin]);
+      digitalWrite(outputPin, lastState[outputPin]);
+    }
   }
 }
 
 void detectEdge(int pin, Adafruit_MQTT_Publish* feed) {
   int state = digitalRead(pin);
   if (state != lastState[pin]) {
-    Serial.print("Publishing state change on pin ");
+    Serial.print(F("Publishing state change on pin "));
     Serial.print(pin);
     if (state == HIGH) {
-      Serial.println(", high");
+      Serial.println(F(", 1"));
       feed->publish("1");
     } else {
-      Serial.println(", low");
+      Serial.println(F(", 0"));
       feed->publish("0");
     }
   }
@@ -490,3 +550,65 @@ void handleHttpClientRequest() {
     Serial.println(F("Http client disconnected"));
   }
 }
+
+const int mVperAmp = 100; // use 100 for 20A Module and 66 for 30A Module
+
+double Voltage = 0;
+double VRMS = 0;
+double AmpsRMS = 0;
+
+void readAcs712(int sensorIn, Adafruit_MQTT_Publish* feed) {
+
+ Voltage = getVPP(sensorIn);
+ VRMS = (Voltage / 2.0) * 0.707;
+ AmpsRMS = (VRMS * 1000) / mVperAmp;
+ Serial.print(AmpsRMS);
+ Serial.print(F(" Amps RMS on "));
+ Serial.println(sensorIn);
+
+ if (AmpsRMS > 0.20) {
+   if (lastState[sensorIn] == LOW) {
+     Serial.println(F("Current rising edge detected. Publishing feed status 1"));
+     feed->publish("1");
+   }
+
+   lastState[sensorIn] = HIGH;
+ } else {
+   if (lastState[sensorIn] == HIGH) {
+     Serial.println(F("Current falling edge detected. Publishing feed status 0"));
+     feed->publish("0");
+   }
+
+   lastState[sensorIn] = LOW;
+ }
+}
+
+float getVPP(int sensorIn) {
+  float result;
+
+  int readValue;             //value read from the sensor
+  int maxValue = 0;          // store max value here
+  int minValue = 1024;          // store min value here
+
+  uint32_t startTime = millis();
+  while ((millis() - startTime) < 300) {
+    readValue = analogRead(sensorIn);
+       
+    // see if you have a new maxValue
+    if (readValue > maxValue) {
+      /* record the maximum sensor value */
+      maxValue = readValue;
+    }
+       
+    if (readValue < minValue) {
+      /* record the maximum sensor value */
+      minValue = readValue;
+    }
+  }
+
+   // Subtract min from max
+   result = ((maxValue - minValue) * 5.0) / 1024.0;
+
+   return result;
+ }
+ 
