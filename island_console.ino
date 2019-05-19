@@ -56,8 +56,6 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
 // Digital Pin layout
 #define FRONT_DOOR_PIN 2
-#define COUNTER_LIGHT_PIN 31
-#define SINK_LIGHT_PIN 30
 #define MOTION_SENSOR_PIN 32
 #define OUTSIDE_LIGHT_PIN 5
 #define KITCHEN_LIGHT_PIN 6
@@ -85,9 +83,6 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
 
 int lastState[80] = {LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW};
 
-//IRrecv irrecv(IR_RECV_PIN);
-//decode_results results;
-
 // Controlling the LED strip
 IRsend irsend;
 
@@ -99,7 +94,6 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 // You don't need to change anything below this line!
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
-/****************************** Feeds ***************************************/
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.island"
 
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
@@ -117,16 +111,6 @@ Adafruit_MQTT_Subscribe ledtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME 
 Adafruit_MQTT_Subscribe kitchenlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
 Adafruit_MQTT_Subscribe outsidelight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
 Adafruit_MQTT_Subscribe islandlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.islandlight");
-Adafruit_MQTT_Subscribe counterlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.counterlight");
-Adafruit_MQTT_Subscribe sinklight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.sinklight");
-
-// Possibly as
-//  #define TOGGLE_TV "1"
-//  #define TOGGLE_SOUNDBAR "2"
-//  Adafruit_MQTT_Subscribe devicetoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/devicetoggle");
-//
-
-/*************************** Sketch Code ************************************/
 
 void setup() {
 
@@ -144,16 +128,10 @@ void setup() {
   pinMode(OUTSIDE_LIGHT_PIN, OUTPUT);
   pinMode(KITCHEN_LIGHT_PIN, OUTPUT);
   pinMode(ISLAND_LIGHT_PIN, OUTPUT);
-  pinMode(COUNTER_LIGHT_PIN, OUTPUT);
-  pinMode(SINK_LIGHT_PIN, OUTPUT);
 
   digitalWrite(OUTSIDE_LIGHT_PIN, HIGH);
   digitalWrite(KITCHEN_LIGHT_PIN, HIGH);
   digitalWrite(ISLAND_LIGHT_PIN, HIGH);
-  digitalWrite(COUNTER_LIGHT_PIN, HIGH);
-  lastState[COUNTER_LIGHT_PIN] = HIGH;
-  digitalWrite(SINK_LIGHT_PIN, HIGH);
-  lastState[SINK_LIGHT_PIN] = HIGH;
 
   Serial.begin(115200);
 
@@ -171,34 +149,19 @@ void setup() {
   //MQTT_connect();
   Serial.println("MQTT subscribe");
   //mqtt.subscribe(&tvtoggle);
-  mqtt.subscribe(&counterlight);
-  mqtt.subscribe(&sinklight);
-  mqtt.subscribe(&kitchenlight);
-  mqtt.subscribe(&islandlight);
-  mqtt.subscribe(&outsidelight);
-  mqtt.subscribe(&ledtoggle);
+  mqtt.subscribe(&kitchenlight, &onSubscriptionEvent);
+  mqtt.subscribe(&islandlight, &onSubscriptionEvent);
+  mqtt.subscribe(&outsidelight, &onSubscriptionEvent);
+  mqtt.subscribe(&ledtoggle, &onSubscriptionEvent);
 
   mqtt.will(WILL_FEED, "0");
 
-  //mqtt.subscribe(&soundbartoggle);
-
   Serial.println("Enable IR");
-  //irrecv.enableIRIn();
-  //irrecv.blink13(true);
 }
 
-void loop() {
-  // Ensure the connection to the MQTT server is alive (this will make the first
-  // connection and automatically reconnect when disconnected).  See the MQTT_connect
-  // function definition further below.
-  now = millis();
-  Ethernet.maintain();
-  MQTT_connect();
-
-  // this is our 'wait for incoming subscription packets' busy subloop
-  Adafruit_MQTT_Subscribe *subscription;
-  while ((subscription = mqtt.readSubscription(1000))) {
-    Serial.println(F("Incoming message"));
+void onSubscriptionEvent(Adafruit_MQTT_Subscribe* subscription) {
+  
+  Serial.println(F("Incoming message"));
     //irrecv.enableIRIn();
     //irrecv.resume();
 
@@ -292,22 +255,19 @@ void loop() {
       Serial.println(F("msg: ISLAND LIGHT"));
       handleMqttToggleCommand(command, ISLAND_LIGHT_PIN, ISLAND_LIGHT_CIRCUIT);
 
-    } else if (subscription == &counterlight) {
+    } 
+}
 
-      Serial.println(F("msg: COUNTER LIGHT"));
-      handleMqttToggleCommand(command, COUNTER_LIGHT_PIN, -1);
+void loop() {
+  // Ensure the connection to the MQTT server is alive (this will make the first
+  // connection and automatically reconnect when disconnected).  See the MQTT_connect
+  // function definition further below.
+  now = millis();
+  Ethernet.maintain();
+  MQTT_connect();
 
-    } else if (subscription == &sinklight) {
-
-      Serial.println(F("msg: SINK LIGHT"));
-      handleMqttToggleCommand(command, SINK_LIGHT_PIN, -1);
-    }
-
-    //else if (subscription == &soundbartoggle) {
-     // Serial.println("msg: TOGGLE SOUNDBAR");
-     // irsend.sendRC6(0x150C, 16);
-   // }
-  }
+  // this is our 'wait for incoming subscription packets' busy subloop
+  mqtt.process(50);
 
   detectEdge(FRONT_DOOR_PIN, &front);
   detectEdge(SIDE_DOOR_PIN, &side);
@@ -315,7 +275,7 @@ void loop() {
   
   handleHttpClientRequest();
 
-  if (lastCurrentSensorRead + CURRENT_SENSOR_INTERVAL_MS < now) {
+  if (now - lastCurrentSensorRead > CURRENT_SENSOR_INTERVAL_MS) {
     lastCurrentSensorRead = now;
 
     if (sensorIndex == 0) {
@@ -337,7 +297,7 @@ void loop() {
   //IR_decode();
   MQTT_ping();
 
-  delay(100);
+  delay(50);
 }
 
 void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
@@ -375,6 +335,10 @@ void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
       Serial.print(F("Setting state to "));
       Serial.print(lastState[outputPin]);
       digitalWrite(outputPin, lastState[outputPin]);
+    } else if (strcmp((char*)command, "2") == 0) {
+      Serial.println(F("ACS relay toggle"));
+      lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      digitalWrite(outputPin, lastState[outputPin]);
     }
   }
 }
@@ -395,35 +359,10 @@ void detectEdge(int pin, Adafruit_MQTT_Publish* feed) {
 
   lastState[pin] = state;
 }
-/*
-void IR_decode() {
-  if (irrecv.decode(&results)) {
-    Serial.println(results.value, HEX);
-    switch (results.decode_type) {
-        case NEC: Serial.println("NEC"); break ;
-        case SONY: Serial.println("SONY"); break ;
-        case RC5: Serial.println("RC5"); break ;
-        case RC6: Serial.println("RC6"); break ;
-        case DISH: Serial.println("DISH"); break ;
-        case SHARP: Serial.println("SHARP"); break ;
-        case JVC: Serial.println("JVC"); break ;
-        case SANYO: Serial.println("SANYO"); break ;
-        case MITSUBISHI: Serial.println("MITSUBISHI"); break ;
-        case SAMSUNG: Serial.println("SAMSUNG"); break ;
-        case LG: Serial.println("LG"); break ;
-        case WHYNTER: Serial.println("WHYNTER"); break ;
-        case AIWA_RC_T501: Serial.println("AIWA_RC_T501"); break ;
-        case PANASONIC: Serial.println("PANASONIC"); break ;
-        case DENON: Serial.println("DENON"); break ;
-      default:
-        case UNKNOWN: Serial.println("UNKNOWN"); break ;
-    }
 
-    irrecv.resume();
-    irrecv.enableIRIn();
-  }
+void onPing(bool result) {
+  lastwill.publish(now);
 }
-*/
 
 void MQTT_ping() {
 
@@ -431,15 +370,10 @@ void MQTT_ping() {
     return;
   }
 
-  if (lastPing + MQTT_PING_INTERVAL_MS < now) {
+  if (now - lastPing > MQTT_PING_INTERVAL_MS) {
     Serial.println(F("Ping"));
     lastPing = now;
-    if (!mqtt.ping()) {
-      Serial.println(F("Failed to ping"));
-      mqtt.disconnect();
-    } else {
-      lastwill.publish(now);
-    }
+    mqtt.pingAsync(onPing);
   }
 }
 
@@ -512,12 +446,8 @@ void handleHttpClientRequest() {
           client.println(lastState[OUTSIDE_LIGHT_PIN]);
           client.print(F("<br />Kitchen light is "));
           client.println(lastState[KITCHEN_LIGHT_PIN]);
-          client.print(F("<br />Counter light is "));
-          client.println(lastState[COUNTER_LIGHT_PIN]);
           client.print(F("<br />Island light is "));
           client.println(lastState[ISLAND_LIGHT_PIN]);
-          client.print(F("<br />Sink light is "));
-          client.println(lastState[SINK_LIGHT_PIN]);
           client.print(F("<br />Front door is "));
           client.println(lastState[FRONT_DOOR_PIN]);
           client.print(F("<br />Side door is "));
