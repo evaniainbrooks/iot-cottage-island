@@ -28,7 +28,7 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 //IPAddress dnsIP (8, 8, 8, 8);
 //If you uncommented either of the above lines, make sure to change "Ethernet.begin(mac)" to "Ethernet.begin(mac, iotIP)" or "Ethernet.begin(mac, iotIP, dnsIP)"
 
-#define VERSION_MESSAGE F("Island Console v0.30 27/08/18")
+#define VERSION_MESSAGE F("Island Console v0.31 27/08/18")
 
 #define AIO_SERVER      "raspberry.home"
 #define AIO_SERVERPORT  1883
@@ -311,6 +311,7 @@ void setup() {
   mqtt.subscribe(&islandlight, &onSubscriptionEvent);
   mqtt.subscribe(&outsidelight, &onSubscriptionEvent);
   mqtt.subscribe(&ledtoggle, &onSubscriptionEvent);
+  mqtt.subscribe(&lock, &onSubscriptionEvent);
 
   mqtt.will(WILL_FEED, "0");
 
