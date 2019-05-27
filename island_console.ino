@@ -377,10 +377,9 @@ void loop() {
   handleHttpClientRequest();
   readCurrentSensors();
 
-  //IR_decode();
   ping();
 
-  delay(50);
+  delay(10);
 }
 
 
