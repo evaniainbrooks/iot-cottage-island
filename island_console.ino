@@ -11,13 +11,18 @@
 #include <Dhcp.h>
 #include <printf.h>
 
+#include <DHT.h>
+#include <DHT_U.h>
+
 unsigned long lastPing = 0; // timestamp
+unsigned long lastTemperatureSensorRead = 0;
 unsigned long lastCurrentSensorRead = 0; // timestamp
 unsigned long connectedSince = 0; // timestamp
 unsigned long now = 0; // timestamp
 unsigned long nextConnectionAttempt = 0; // timestamp
 unsigned long failedConnectionAttempts = 0;
 unsigned long sensorIndex = 0;
+unsigned long sensorDelayMs;
 
 /************************* Ethernet Client Setup *****************************/
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
@@ -28,7 +33,7 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 //IPAddress dnsIP (8, 8, 8, 8);
 //If you uncommented either of the above lines, make sure to change "Ethernet.begin(mac)" to "Ethernet.begin(mac, iotIP)" or "Ethernet.begin(mac, iotIP, dnsIP)"
 
-#define VERSION_MESSAGE F("Island Console v0.31 27/08/18")
+#define VERSION_MESSAGE F("Island Console v0.40 20/06/19")
 
 #define AIO_SERVER      "raspberry.home"
 #define AIO_SERVERPORT  1883
@@ -58,11 +63,12 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define Slow 0xFFC837
 
 // Digital Pin layout
+#define DHT_PIN 36
 #define MOTION_SENSOR_PIN 32
 #define OUTSIDE_LIGHT_PIN 5
 #define KITCHEN_LIGHT_PIN 6
 #define ISLAND_LIGHT_PIN 33
-#define SIDE_DOOR_PIN 2 // TODO: RELOCATE PIN 8 -> 2
+#define SIDE_DOOR_PIN 37 
 
 #define RADIO_PIN_1 7
 #define RADIO_PIN_2 8
@@ -73,6 +79,9 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define ISLAND_LIGHT_CIRCUIT A1
 #define OUTSIDE_LIGHT_CIRCUIT A2
 #define KITCHEN_LIGHT_CIRCUIT A3
+
+#define DHT_TYPE DHT11     // DHT 22 (AM2302)
+DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
@@ -257,11 +266,17 @@ Adafruit_MQTT_Publish islandlight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAM
 Adafruit_MQTT_Publish outsidelight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
 Adafruit_MQTT_Publish lock_pub = Adafruit_MQTT_Publish(&mqtt, LOCK_FEED);
 
+Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.temperature");
+Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.humidity");
+
 Adafruit_MQTT_Subscribe ledtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.led");
 Adafruit_MQTT_Subscribe kitchenlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
 Adafruit_MQTT_Subscribe outsidelight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
 Adafruit_MQTT_Subscribe islandlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.islandlight");
 Adafruit_MQTT_Subscribe lock = Adafruit_MQTT_Subscribe(&mqtt, LOCK_FEED);
+
+float lastTemp;
+float lastHumid;
 
 
 RF24 radio(RADIO_PIN_1, RADIO_PIN_2);
@@ -269,6 +284,68 @@ mqttrb::Bridge mqttRadioBridge = mqttrb::Bridge(&radio, "/feeds/");
 
 // Radio pipe addresses for the 2 nodes to communicate.
 const uint64_t pipes[2] = { 0xF0F0F0F0E1LL, 0xF0F0F0F0D2LL };
+
+const int mVperAmp = 100; // use 100 for 20A Module and 66 for 30A Module
+
+double Voltage = 0;
+double VRMS = 0;
+double AmpsRMS = 0;
+
+void readAcs712(int sensorIn, Adafruit_MQTT_Publish* feed, bool forceUpdate = false) {
+
+ Voltage = getVPP(sensorIn);
+ VRMS = (Voltage / 2.0) * 0.707;
+ AmpsRMS = (VRMS * 1000) / mVperAmp;
+ Serial.print(AmpsRMS);
+ Serial.print(F(" Amps RMS on "));
+ Serial.println(sensorIn);
+
+ if (AmpsRMS > 0.20) {
+   if (lastState[sensorIn] == LOW || forceUpdate) {
+     Serial.println(F("Current rising edge detected. Publishing feed status 1"));
+     if (feed) { feed->publish("1"); }
+   }
+
+   lastState[sensorIn] = HIGH;
+ } else {
+   if (lastState[sensorIn] == HIGH || forceUpdate) {
+     Serial.println(F("Current falling edge detected. Publishing feed status 0"));
+     if (feed) { feed->publish("0"); }
+   }
+
+   lastState[sensorIn] = LOW;
+ }
+}
+
+float getVPP(int sensorIn) {
+  float result;
+
+  int readValue;             //value read from the sensor
+  int maxValue = 0;          // store max value here
+  int minValue = 1024;          // store min value here
+
+  uint32_t startTime = millis();
+  while ((millis() - startTime) < 300) {
+    readValue = analogRead(sensorIn);
+       
+    // see if you have a new maxValue
+    if (readValue > maxValue) {
+      /* record the maximum sensor value */
+      maxValue = readValue;
+    }
+       
+    if (readValue < minValue) {
+      /* record the maximum sensor value */
+      minValue = readValue;
+    }
+  }
+
+   // Subtract min from max
+   result = ((maxValue - minValue) * 5.0) / 1024.0;
+
+   return result;
+ }
+ 
 
 void setup() {
 
@@ -316,6 +393,7 @@ void setup() {
   mqtt.will(WILL_FEED, "0");
 
   // Setup Radio
+  /*
   radio.begin();
   radio.disableDynamicPayloads();
   radio.setRetries(5,15);
@@ -324,17 +402,52 @@ void setup() {
   radio.startListening();
   radio.printDetails();
 
-  mqttRadioBridge.addTopic(LOCK_FEED, &lock, &lock_pub);
+  mqttRadioBridge.addTopic(LOCK_FEED, &lock, &lock_pub);*/
 
   delay(1000);
   
-  readAcs712(KITCHEN_LIGHT_CIRCUIT, &kitchenlight_pub);
-  readAcs712(ISLAND_LIGHT_CIRCUIT, &islandlight_pub);
-  readAcs712(OUTSIDE_LIGHT_CIRCUIT, &outsidelight_pub);
+  readAcs712(KITCHEN_LIGHT_CIRCUIT, &kitchenlight_pub, true);
+  readAcs712(ISLAND_LIGHT_CIRCUIT, &islandlight_pub, true);
+  readAcs712(OUTSIDE_LIGHT_CIRCUIT, &outsidelight_pub, true);
 
   //sendLedCommand("off");
 
+  initSensor();
   Serial.println(F("Finished init"));
+}
+
+void initSensor() {
+  // Initialize device.
+  dht.begin();
+
+  sensor_t sensor;
+  dht.temperature().getSensor(&sensor);
+  Serial.println(F("------------------------------------"));
+  Serial.println("Temperature");
+  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
+  Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
+  Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
+  Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println(" *C");
+  Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println(" *C");
+  Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println(" *C");
+
+  Serial.println("------------------------------------");
+  // Print humidity sensor details.
+  dht.humidity().getSensor(&sensor);
+  Serial.println(F("------------------------------------"));
+  Serial.println("Humidity");
+  Serial.print  ("Sensor:       "); Serial.println(sensor.name);
+  Serial.print  ("Driver Ver:   "); Serial.println(sensor.version);
+  Serial.print  ("Unique ID:    "); Serial.println(sensor.sensor_id);
+  Serial.print  ("Max Value:    "); Serial.print(sensor.max_value); Serial.println("%");
+  Serial.print  ("Min Value:    "); Serial.print(sensor.min_value); Serial.println("%");
+  Serial.print  ("Resolution:   "); Serial.print(sensor.resolution); Serial.println("%");
+  Serial.print  ("Min Delay:    "); Serial.print(sensor.min_delay / 1000); Serial.println("ms");
+
+  Serial.println("------------------------------------");
+  // Set delay between sensor readings based on sensor details.
+  //sensorDelayMs = sensor.min_delay / 1000;
+  sensorDelayMs = 30000;
 }
 
 void onSubscriptionEvent(Adafruit_MQTT_Subscribe* subscription) {
@@ -372,7 +485,14 @@ void loop() {
   connectMqtt();
 
   mqtt.process(50);
-  mqttRadioBridge.process(50);
+  //mqttRadioBridge.process(50);
+
+    // Get temperature event and print its value.
+  if (now - lastTemperatureSensorRead > sensorDelayMs) {
+    Serial.println(F("sensorRead"));
+    lastTemperatureSensorRead = now;
+    readSensor();
+  }
 
   detectEdge(SIDE_DOOR_PIN, &side);
   detectEdge(MOTION_SENSOR_PIN, &motion);
@@ -383,6 +503,37 @@ void loop() {
   ping();
 
   delay(10);
+}
+
+void readSensor() {
+
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println(F("Error reading temperature!"));
+  }
+  else {
+    Serial.print(F("Temperature: "));
+    Serial.print(event.temperature);
+    Serial.println(F(" *C"));
+  }
+
+  lastTemp = event.temperature;
+  temp.publish(event.temperature);
+
+  // Get humidity event and print its value.
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println(F("Error reading humidity!"));
+  }
+  else {
+    Serial.print(F("Humidity: "));
+    Serial.print(event.relative_humidity);
+    Serial.println("%");
+  }
+
+  lastHumid = event.relative_humidity;
+  humid.publish(event.relative_humidity);
 }
 
 
@@ -625,6 +776,10 @@ void handleHttpClientRequest() {
           client.println(lastState[ISLAND_LIGHT_PIN]);
           client.print(F("<br />Front door is "));
           client.println(lastState[SIDE_DOOR_PIN]);
+          client.print(F("<br />Temperature "));
+          client.print(lastTemp);
+          client.print(F("<br />Humidity "));
+          client.print(lastHumid);
           client.print(F("<br />Last ping "));
           client.print(lastPing);
           client.print(F("<br />Uptime "));
@@ -654,64 +809,3 @@ void handleHttpClientRequest() {
   }
 }
 
-const int mVperAmp = 100; // use 100 for 20A Module and 66 for 30A Module
-
-double Voltage = 0;
-double VRMS = 0;
-double AmpsRMS = 0;
-
-void readAcs712(int sensorIn, Adafruit_MQTT_Publish* feed) {
-
- Voltage = getVPP(sensorIn);
- VRMS = (Voltage / 2.0) * 0.707;
- AmpsRMS = (VRMS * 1000) / mVperAmp;
- Serial.print(AmpsRMS);
- Serial.print(F(" Amps RMS on "));
- Serial.println(sensorIn);
-
- if (AmpsRMS > 0.20) {
-   if (lastState[sensorIn] == LOW) {
-     Serial.println(F("Current rising edge detected. Publishing feed status 1"));
-     if (feed) { feed->publish("1"); }
-   }
-
-   lastState[sensorIn] = HIGH;
- } else {
-   if (lastState[sensorIn] == HIGH) {
-     Serial.println(F("Current falling edge detected. Publishing feed status 0"));
-     if (feed) { feed->publish("0"); }
-   }
-
-   lastState[sensorIn] = LOW;
- }
-}
-
-float getVPP(int sensorIn) {
-  float result;
-
-  int readValue;             //value read from the sensor
-  int maxValue = 0;          // store max value here
-  int minValue = 1024;          // store min value here
-
-  uint32_t startTime = millis();
-  while ((millis() - startTime) < 300) {
-    readValue = analogRead(sensorIn);
-       
-    // see if you have a new maxValue
-    if (readValue > maxValue) {
-      /* record the maximum sensor value */
-      maxValue = readValue;
-    }
-       
-    if (readValue < minValue) {
-      /* record the maximum sensor value */
-      minValue = readValue;
-    }
-  }
-
-   // Subtract min from max
-   result = ((maxValue - minValue) * 5.0) / 1024.0;
-
-   return result;
- }
- 
