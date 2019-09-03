@@ -1,9 +1,6 @@
-#include <IRremote.h>
 #include <SPI.h>
 #include "Adafruit_MQTT.h"
 #include "Adafruit_MQTT_Client.h"
-#include "nRF24L01.h"
-#include "RF24.h"
 
 #include <Ethernet.h>
 #include <EthernetClient.h>
@@ -16,6 +13,7 @@
 
 unsigned long lastPing = 0; // timestamp
 unsigned long lastTemperatureSensorRead = 0;
+unsigned long lastGasSensorRead = 0;
 unsigned long lastCurrentSensorRead = 0; // timestamp
 unsigned long connectedSince = 0; // timestamp
 unsigned long now = 0; // timestamp
@@ -24,16 +22,9 @@ unsigned long failedConnectionAttempts = 0;
 unsigned long sensorIndex = 0;
 unsigned long sensorDelayMs;
 
-/************************* Ethernet Client Setup *****************************/
 byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 
-//Uncomment the following, and set to a valid ip if you don't have dhcp available.
-//IPAddress iotIP (192, 168, 0, 42);
-//Uncomment the following, and set to your preference if you don't have automatic dns.
-//IPAddress dnsIP (8, 8, 8, 8);
-//If you uncommented either of the above lines, make sure to change "Ethernet.begin(mac)" to "Ethernet.begin(mac, iotIP)" or "Ethernet.begin(mac, iotIP, dnsIP)"
-
-#define VERSION_MESSAGE F("Island Console v0.40 20/06/19")
+#define VERSION_MESSAGE F("Island Console v0.46 03/09/19")
 
 #define AIO_SERVER      "raspberry.home"
 #define AIO_SERVERPORT  1883
@@ -44,6 +35,7 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define MQTT_CONNECT_RETRY_MAX 5
 #define ping_INTERVAL_MS 60000
 #define CURRENT_SENSOR_INTERVAL_MS 3000
+#define GAS_SENSOR_READ_INTERVAL_MS 5000
 
 // LED strip commands
 #define On_Off 0xFF02FD
@@ -63,169 +55,30 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 #define Slow 0xFFC837
 
 // Digital Pin layout
-#define DHT_PIN 36
-#define MOTION_SENSOR_PIN 32
 #define OUTSIDE_LIGHT_PIN 5
 #define KITCHEN_LIGHT_PIN 6
+#define MOTION_SENSOR_PIN 32
 #define ISLAND_LIGHT_PIN 33
+#define DHT_PIN 36
 #define SIDE_DOOR_PIN 37 
-
-#define RADIO_PIN_1 7
-#define RADIO_PIN_2 8
-
-#define IR_PIN 9
+#define BUTTON0_PIN 41
+#define BUTTON1_PIN 43
+#define LED_RED_PIN 44
+#define LED_GREEN_PIN 45
+#define LED_BLUE_PIN 46
+#define LED1_PIN 47 
+#define LED0_PIN 48
 
 // Analog pin layout
 #define ISLAND_LIGHT_CIRCUIT A1
 #define OUTSIDE_LIGHT_CIRCUIT A2
 #define KITCHEN_LIGHT_CIRCUIT A3
+#define GAS_SENSOR_PIN A4
 
 #define DHT_TYPE DHT11     // DHT 22 (AM2302)
 DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
 #define halt(s) { Serial.println(F( s )); while(1);  }
-
-namespace mqttrb {
-  class Bridge;
-  
-  struct Topic {
-    Adafruit_MQTT_Subscribe* sub;
-    Adafruit_MQTT_Publish* pub;
-    const char* name;
-  };
-  
-  struct Message {
-    static const int NAME_SIZE_MAX = 20;
-    static const int VALUE_SIZE_MAX = 12;
-    
-    char name[NAME_SIZE_MAX];
-    char value[VALUE_SIZE_MAX];
-  };
-  
-  class Bridge {
-  
-  public:
-    static const int MAX_TOPICS = 10;
-  
-    Bridge(RF24* radio, const char* prefix = NULL) : prefix(prefix), radio(radio), topicCount(0) {};
-  
-    void addTopic(const char* name, Adafruit_MQTT_Subscribe* sub, Adafruit_MQTT_Publish* pub) {
-      topics[topicCount].name = name;
-      topics[topicCount].sub = sub;
-      topics[topicCount].pub = pub;
-  
-      ++topicCount;
-    }
-
-    const char* shortName(const char* topicName) {
-      const char* p = strstr(topicName, this->prefix);
-      if (p != NULL) {
-        return p + strlen(this->prefix);
-      }
-
-      return topicName;
-    }
-  
-    Topic* getTopic(int index) {
-      if (index >= topicCount) { return NULL; }
-      
-      return &topics[index];
-    }
-  
-    Topic* getTopic(const char* name) {
-      Topic* result = NULL;
-      for (int i = 0; i < topicCount; ++i) {
-        if (strstr(topics[i].name, name) != NULL) {
-          result = &topics[i];
-          break;
-        }
-      }
-  
-      return result;
-    }
-  
-    Topic* getTopic(Adafruit_MQTT_Subscribe* sub) {
-      Topic* result = NULL;
-      for (int i = 0; i < topicCount; ++i) {
-        if (topics[i].sub == sub) {
-          result = &topics[i];
-          break;
-        }
-      }
-  
-      return result;
-    }
-  
-    void process(uint32_t timeoutMs = 50) {
-      // Wait here until we get a response, or timeout
-      unsigned long startedAt = millis();
-      bool timeout = false;
-      while (!this->radio->available() && !timeout) {
-        if (millis() - startedAt > timeoutMs) {
-          timeout = true;
-        }
-      }
-  
-      if (timeout) {
-        Serial.println(F("Failed, response timed out."));
-        return;
-      }
-      
-      Message message;
-      this->radio->read(&message, sizeof(Message));
-  
-      Serial.print(F("Got response name="));
-      Serial.print(message.name);
-      Serial.print(F(" value="));
-      Serial.println(message.value);
-  
-      Topic* topic = getTopic(message.name);
-      if (topic == NULL) {
-        Serial.print(F("Couldn't find topic "));
-        Serial.println(message.name);
-        return;
-      }
-
-      topic->pub->publish(message.value);
-    }
-  
-    void publish(const char* feedName, const char* val) {
-      Topic* topic = getTopic(feedName);
-      if (topic == NULL) { return; }
-  
-      writeMessage(topic, val);
-    }
-  
-    void onSubscriptionEvent(Adafruit_MQTT_Subscribe* sub) {
-      Topic* topic = getTopic(sub);
-      if (topic == NULL) { return; }
-      
-      const char* val = (const char*)sub->lastread;
-      writeMessage(topic, val);
-    }
-  
-    void writeMessage(Topic* topic, const char* val) {
-      strcpy(&this->message.name[0], shortName(topic->name));
-      strcpy(&this->message.value[0], val);
-
-      Serial.print(F("Writing "));
-      Serial.print(val);
-      Serial.print(F(" to "));
-      Serial.println(topic->name);
-  
-      this->radio->stopListening();
-      this->radio->write(&this->message, sizeof(Message));
-      this->radio->startListening();
-    }
-  
-  public:
-    int topicCount;
-    Message message;
-    Topic topics[MAX_TOPICS];
-    RF24* radio;
-    const char* prefix;
-  };
-}
 
 void(* __resetFunc) (void) = 0; //declare reset function @ address 0
 
@@ -240,9 +93,6 @@ void resetFunc(const __FlashStringHelper* msg, unsigned long delayMs) {
 
 int lastState[80] = {LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW,LOW};
 
-// Controlling the LED strip
-IRsend irsend;
-
 EthernetClient client;
 EthernetServer server(SERVER_LISTEN_PORT);
 
@@ -252,7 +102,7 @@ Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO
 #define halt(s) { Serial.println(F( s )); while(1);  }
 
 #define WILL_FEED AIO_USERNAME "/feeds/nodes.island"
-#define LOCK_FEED AIO_USERNAME "/feeds/locks.frontdoor"
+//#define LOCK_FEED AIO_USERNAME "/feeds/locks.frontdoor"
 
 Adafruit_MQTT_Publish lastwill = Adafruit_MQTT_Publish(&mqtt, WILL_FEED);
 
@@ -264,26 +114,30 @@ Adafruit_MQTT_Publish motion = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds
 Adafruit_MQTT_Publish kitchenlight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
 Adafruit_MQTT_Publish islandlight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.islandlight");
 Adafruit_MQTT_Publish outsidelight_pub = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
-Adafruit_MQTT_Publish lock_pub = Adafruit_MQTT_Publish(&mqtt, LOCK_FEED);
+
+Adafruit_MQTT_Publish button0 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.button0");
+Adafruit_MQTT_Publish button1 = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.button1");
 
 Adafruit_MQTT_Publish temp = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.temperature");
 Adafruit_MQTT_Publish humid = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/island.humidity");
+Adafruit_MQTT_Publish gas = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/smoke.island");
 
 Adafruit_MQTT_Subscribe ledtoggle = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.led");
 Adafruit_MQTT_Subscribe kitchenlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.kitchenlight");
 Adafruit_MQTT_Subscribe outsidelight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.outsidelight");
 Adafruit_MQTT_Subscribe islandlight = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/toggle.islandlight");
-Adafruit_MQTT_Subscribe lock = Adafruit_MQTT_Subscribe(&mqtt, LOCK_FEED);
+
+Adafruit_MQTT_Subscribe led0 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/island.led0");
+Adafruit_MQTT_Subscribe led1 = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/island.led1");
+
+Adafruit_MQTT_Subscribe ledred = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/island.ledred");
+Adafruit_MQTT_Subscribe ledgreen = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/island.ledgreen");
+Adafruit_MQTT_Subscribe ledblue = Adafruit_MQTT_Subscribe(&mqtt, AIO_USERNAME "/feeds/island.ledblue");
+
 
 float lastTemp;
 float lastHumid;
-
-
-RF24 radio(RADIO_PIN_1, RADIO_PIN_2);
-mqttrb::Bridge mqttRadioBridge = mqttrb::Bridge(&radio, "/feeds/");
-
-// Radio pipe addresses for the 2 nodes to communicate.
-const uint64_t pipes[2] = { 0xF0F0F0F0E1LL, 0xF0F0F0F0D2LL };
+int lastGasSensor;
 
 const int mVperAmp = 100; // use 100 for 20A Module and 66 for 30A Module
 
@@ -348,25 +202,45 @@ float getVPP(int sensorIn) {
  
 
 void setup() {
-
-  // Disable SD card
   pinMode(4, OUTPUT);
   digitalWrite(4, HIGH);
   
   delay(2000);
 
+  pinMode(BUTTON0_PIN, INPUT_PULLUP);
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+
+  // These pins are input pullup, so set the expected default state
+  lastState[BUTTON0_PIN] = HIGH;
+  lastState[BUTTON1_PIN] = HIGH;
+  
   pinMode(SIDE_DOOR_PIN, INPUT_PULLUP);
+  lastState[SIDE_DOOR_PIN] = HIGH;
+  
   pinMode(MOTION_SENSOR_PIN, INPUT);
-  pinMode(IR_PIN, OUTPUT);
 
   pinMode(OUTSIDE_LIGHT_PIN, OUTPUT);
   pinMode(KITCHEN_LIGHT_PIN, OUTPUT);
   pinMode(ISLAND_LIGHT_PIN, OUTPUT);
 
+  pinMode(LED_RED_PIN, OUTPUT);
+  pinMode(LED_GREEN_PIN, OUTPUT);
+  pinMode(LED_BLUE_PIN, OUTPUT);
+
+  pinMode(LED0_PIN, OUTPUT);
+  pinMode(LED1_PIN, OUTPUT);
+
   digitalWrite(OUTSIDE_LIGHT_PIN, HIGH);
   digitalWrite(KITCHEN_LIGHT_PIN, HIGH);
   digitalWrite(ISLAND_LIGHT_PIN, HIGH);
 
+  analogWrite(LED_RED_PIN, 0);
+  analogWrite(LED_GREEN_PIN, 0);
+  analogWrite(LED_BLUE_PIN, 0);
+
+  pinMode(LED0_PIN, LOW);
+  pinMode(LED1_PIN, LOW);
+  
   Serial.begin(115200);
   printf_begin();
   delay(100);
@@ -382,27 +256,20 @@ void setup() {
     resetFunc(F("DHCP resolution failed"), 30000);
   }
 
-  //connectMqtt();
   Serial.println("MQTT subscribe");
   mqtt.subscribe(&kitchenlight, &onSubscriptionEvent);
   mqtt.subscribe(&islandlight, &onSubscriptionEvent);
   mqtt.subscribe(&outsidelight, &onSubscriptionEvent);
   mqtt.subscribe(&ledtoggle, &onSubscriptionEvent);
-  mqtt.subscribe(&lock, &onSubscriptionEvent);
+
+  mqtt.subscribe(&led0, &onSubscriptionEvent);
+  mqtt.subscribe(&led1, &onSubscriptionEvent);
+  
+  mqtt.subscribe(&ledred, &onLedStripSubscriptionEvent);
+  mqtt.subscribe(&ledblue, &onLedStripSubscriptionEvent);
+  mqtt.subscribe(&ledgreen, &onLedStripSubscriptionEvent);
 
   mqtt.will(WILL_FEED, "0");
-
-  // Setup Radio
-  /*
-  radio.begin();
-  radio.disableDynamicPayloads();
-  radio.setRetries(5,15);
-  radio.openWritingPipe(pipes[0]);
-  radio.openReadingPipe(1, pipes[1]);
-  radio.startListening();
-  radio.printDetails();
-
-  mqttRadioBridge.addTopic(LOCK_FEED, &lock, &lock_pub);*/
 
   delay(1000);
   
@@ -410,9 +277,9 @@ void setup() {
   readAcs712(ISLAND_LIGHT_CIRCUIT, &islandlight_pub, true);
   readAcs712(OUTSIDE_LIGHT_CIRCUIT, &outsidelight_pub, true);
 
-  //sendLedCommand("off");
-
   initSensor();
+  lastGasSensor = analogRead(GAS_SENSOR_PIN);
+  lastGasSensorRead = millis();
   Serial.println(F("Finished init"));
 }
 
@@ -450,33 +317,74 @@ void initSensor() {
   sensorDelayMs = 30000;
 }
 
+
+void onLedStripSubscriptionEvent(Adafruit_MQTT_Subscribe* subscription) {
+  Serial.println(F("Incoming message"));
+  int val = atoi((char*)subscription->lastread);
+  
+  if (subscription == &ledred) {
+
+    analogWrite(LED_RED_PIN, val);
+    lastState[LED_RED_PIN] = val;
+    
+  } else if (subscription == &ledgreen) {
+    
+    analogWrite(LED_GREEN_PIN, val);
+    lastState[LED_GREEN_PIN] = val;
+    
+  } else if (subscription == &ledblue) {
+    
+    analogWrite(LED_BLUE_PIN, val);
+    lastState[LED_BLUE_PIN] = val;
+  }
+}
+
 void onSubscriptionEvent(Adafruit_MQTT_Subscribe* subscription) {
   
   Serial.println(F("Incoming message"));
-    char* command = (char*)subscription->lastread;
-    command[0] = tolower(command[0]);
-    if (subscription == &ledtoggle) {
-     
-      sendLedCommand(command);
-      
-    } else if (subscription == &outsidelight) {
+  char* command = (char*)subscription->lastread;
+  command[0] = tolower(command[0]);
+  if (subscription == &outsidelight) {
 
-      Serial.println(F("msg: OUTSIDE LIGHT"));
-      handleMqttToggleCommand(command, OUTSIDE_LIGHT_PIN, OUTSIDE_LIGHT_CIRCUIT);
+    Serial.println(F("msg: OUTSIDE LIGHT"));
+    handleMqttToggleCommand(command, OUTSIDE_LIGHT_PIN, OUTSIDE_LIGHT_CIRCUIT);
 
-    } else if (subscription == &kitchenlight) {
+  } else if (subscription == &kitchenlight) {
 
-      Serial.println(F("msg: KITCHEN LIGHT"));
-      handleMqttToggleCommand(command, KITCHEN_LIGHT_PIN, KITCHEN_LIGHT_CIRCUIT);
+    Serial.println(F("msg: KITCHEN LIGHT"));
+    handleMqttToggleCommand(command, KITCHEN_LIGHT_PIN, KITCHEN_LIGHT_CIRCUIT);
 
-    } else if (subscription == &islandlight) {
+  } else if (subscription == &islandlight) {
 
-      Serial.println(F("msg: ISLAND LIGHT"));
-      handleMqttToggleCommand(command, ISLAND_LIGHT_PIN, ISLAND_LIGHT_CIRCUIT);
+    Serial.println(F("msg: ISLAND LIGHT"));
+    handleMqttToggleCommand(command, ISLAND_LIGHT_PIN, ISLAND_LIGHT_CIRCUIT);
 
-    } 
+  } else if (subscription == &led0) {
 
-    mqttRadioBridge.onSubscriptionEvent(subscription);
+    Serial.println(F("msg: LED0"));
+    handleMqttToggleLedCommand(command, LED0_PIN);
+
+  } else if (subscription == &led1) {
+
+    Serial.println(F("msg: LED1"));
+    handleMqttToggleLedCommand(command, LED1_PIN);
+  }
+}
+
+
+void readGasSensor(bool force = false) {
+  if (force || now - lastGasSensorRead > GAS_SENSOR_READ_INTERVAL_MS) {
+    uint32_t sensor = analogRead(GAS_SENSOR_PIN);
+    bool sensorChanged = abs(lastGasSensor - sensor) > 50;
+    bool sensorAboveThreshold = sensor > 400;
+
+    lastGasSensorRead = now;
+    lastGasSensor = sensor;
+
+    if (force || sensorChanged || sensorAboveThreshold) {
+      gas.publish(sensor);
+    }
+  }
 }
 
 void loop() {
@@ -487,6 +395,19 @@ void loop() {
   mqtt.process(50);
   //mqttRadioBridge.process(50);
 
+
+  detectEdge(SIDE_DOOR_PIN, &side);
+  detectEdge(MOTION_SENSOR_PIN, &motion);
+
+  detectEdge(BUTTON0_PIN, &button0);
+
+  detectEdge(BUTTON1_PIN, &button1);
+  
+  handleHttpClientRequest();
+  readCurrentSensors();
+
+  ping();
+  
     // Get temperature event and print its value.
   if (now - lastTemperatureSensorRead > sensorDelayMs) {
     Serial.println(F("sensorRead"));
@@ -494,13 +415,7 @@ void loop() {
     readSensor();
   }
 
-  detectEdge(SIDE_DOOR_PIN, &side);
-  detectEdge(MOTION_SENSOR_PIN, &motion);
-  
-  handleHttpClientRequest();
-  readCurrentSensors();
-
-  ping();
+  readGasSensor();
 
   delay(10);
 }
@@ -536,75 +451,6 @@ void readSensor() {
   humid.publish(event.relative_humidity);
 }
 
-
-void sendLedCommand(const char* command) {
-  Serial.print(F("msg: TOGGLE LED "));
-  Serial.println(command);
-
-  if (strstr(command, "on") != NULL || strstr(command, "off") != NULL) {
-    irsend.sendNEC(On_Off, 32);
-    delay(40);
-  }
-
-  if (strstr(command, "blue") != NULL) {
-    irsend.sendNEC(Blue, 32);
-    delay(40);
-  } else if (strstr(command, "red") != NULL) {
-    irsend.sendNEC(Red, 32);
-    delay(40);
-  } else if (strstr(command, "green") != NULL) {
-    irsend.sendNEC(Green, 32);
-    delay(40);
-  } else if (strstr(command, "white") != NULL) {
-    irsend.sendNEC(White, 32);
-    delay(40);
-  } else if (strstr(command, "blink") != NULL || strstr(command, "flash") != NULL) {
-    irsend.sendNEC(Flash, 32);
-    delay(40);
-  } else if (strstr(command, "purple") != NULL) {
-    irsend.sendNEC(Purple, 32);
-    delay(40);
-  }
-
-  if (strstr(command, "brighter") != NULL) {
-    irsend.sendNEC(Brighter, 32);
-    delay(40);
-  } else if (strstr(command, "dimmer") != NULL) {
-    irsend.sendNEC(Dimmer, 32);
-    delay(40);
-  }
-
-  if (strstr(command, "fade") != NULL) {
-    irsend.sendNEC(Fade7, 32);
-    delay(40);
-  } else if (strstr(command, "strobe") != NULL) {
-    irsend.sendNEC(Jump7, 32);
-    delay(40);
-  }
-
-  if (strstr(command, "slow") != NULL) {
-    irsend.sendNEC(Slow, 32);
-    delay(40);
-  } else if (strstr(command, "fast") != NULL) {
-    irsend.sendNEC(Fast, 32);
-    delay(40);
-  }
-
-  if (strstr(command, "brightest")  != NULL) {
-    for (int i = 0; i < 13; ++i) {
-      irsend.sendNEC(Brighter, 32);
-      delay(40);
-    }
-  }
-
-  if (strstr(command, "dimmest") != NULL) {
-    for (int i = 0; i < 13; ++i) {
-      irsend.sendNEC(Dimmer, 32);
-      delay(40);
-    }
-  }
-}
-
 void readCurrentSensors() {
   if (now - lastCurrentSensorRead > CURRENT_SENSOR_INTERVAL_MS) {
     lastCurrentSensorRead = now;
@@ -624,6 +470,23 @@ void readCurrentSensors() {
     
     sensorIndex = (sensorIndex + 1) % 3;
   }
+}
+
+void handleMqttToggleLedCommand(const char* command, int outputPin) {
+    if (strcmp((char *)command, "1") == 0) {
+      Serial.print(F("Turning on "));
+      Serial.println(outputPin);
+      lastState[outputPin] = HIGH;
+      digitalWrite(outputPin, lastState[outputPin]);
+    } else if (strcmp((char *)command, "0") == 0) {
+      Serial.print(F("Turning off "));
+      Serial.println(outputPin);
+      lastState[outputPin] = LOW;
+      digitalWrite(outputPin, lastState[outputPin]);
+    } else {
+      Serial.print(F("Unknown command"));
+      Serial.println((char*)command);
+    }
 }
 
 void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
@@ -651,6 +514,7 @@ void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
     if (strcmp((char *)command, "1") == 0 && lastState[acsPin] == LOW) {
       Serial.println(F("ACS relay is OFF (turn on)"));
       lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      lastState[acsPin] = HIGH; // Optimistic toggling of ACS pin state. This avoids an extra rising edge message being published
       Serial.print(F("Setting state to "));
       Serial.print(lastState[outputPin]);
       digitalWrite(outputPin, lastState[outputPin]);
@@ -658,12 +522,14 @@ void handleMqttToggleCommand(const char* command, int outputPin, int acsPin) {
     } else if (strcmp((char *)command, "0") == 0 && lastState[acsPin] == HIGH) {
       Serial.println(F("ACS relay is ON (turn off)"));
       lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      lastState[acsPin] = lastState[acsPin] == HIGH ? LOW : HIGH;  // Optimistic toggling of ACS pin state. This avoids an extra falling edge message being published
       Serial.print(F("Setting state to "));
       Serial.print(lastState[outputPin]);
       digitalWrite(outputPin, lastState[outputPin]);
     } else if (strcmp((char*)command, "2") == 0) {
       Serial.println(F("ACS relay toggle"));
       lastState[outputPin] = lastState[outputPin] == HIGH ? LOW : HIGH;
+      lastState[acsPin] = lastState[acsPin] == HIGH ? LOW : HIGH; // Optimistic toggling of ACS pin state
       digitalWrite(outputPin, lastState[outputPin]);
     }
   }
@@ -687,6 +553,7 @@ void detectEdge(int pin, Adafruit_MQTT_Publish* feed) {
 }
 
 void onPing(bool result) {
+  readGasSensor(true);
   lastwill.publish(now);
 }
 
@@ -768,6 +635,11 @@ void handleHttpClientRequest() {
           client.print(F("<h1>"));
           client.print(VERSION_MESSAGE);
           client.println(F("</h1>"));
+          client.print(F("<br />Led0 is "));
+          client.println(lastState[LED0_PIN]);
+          client.print(F("<br />Led1 is "));
+          client.println(lastState[LED1_PIN]);
+          
           client.print(F("<br />Outside light is "));
           client.println(lastState[OUTSIDE_LIGHT_PIN]);
           client.print(F("<br />Kitchen light is "));
@@ -780,6 +652,8 @@ void handleHttpClientRequest() {
           client.print(lastTemp);
           client.print(F("<br />Humidity "));
           client.print(lastHumid);
+          client.print(F("<br />Smoke "));
+          client.print(lastGasSensor);
           client.print(F("<br />Last ping "));
           client.print(lastPing);
           client.print(F("<br />Uptime "));
